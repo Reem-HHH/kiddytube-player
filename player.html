@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>KiddyTube player</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #stage { position: fixed; left: 0; top: 0; right: 0; bottom: 0; background: #000; overflow: hidden; }
+  #stage iframe { pointer-events: none; border: 0; display: block; width: 100%; height: 100%; }
+  #cover { position: fixed; left: 0; top: 0; right: 0; bottom: 0; background: #000; display: none; z-index: 5; }
+  #mock { position: fixed; left: 0; right: 0; top: 40%; text-align: center; color: #8f8; font: 28px/1.4 sans-serif; display: none; z-index: 6; }
+</style>
+</head>
+<body>
+<div id="stage"><div id="p"></div></div>
+<div id="cover"></div>
+<div id="mock"></div>
+<script>
+/* KiddyTube player bridge.
+ * The TV app embeds this page in an iframe and talks to it with postMessage (JSON strings, {kt:1,...}).
+ *   app -> page : {t:'load', id, start}  {t:'toggle'|'play'|'pause'|'stop'}  {t:'seek', sec}
+ *   page -> app : {t:'hello'} {t:'ready'} {t:'state', s} {t:'progress', pos, dur, s} {t:'ended'} {t:'error', code} {t:'key', keyCode, key}
+ * It can be hosted over https (GitHub Pages etc.) so YouTube gets a real Referer; see README.
+ * Query: ?ref=<https url identifying the app>  &mock=1 (offline fake player for tests)  &dur=<seconds> (mock length) */
+(function () {
+  'use strict';
+  var q = {};
+  location.search.replace(/^\?/, '').split('&').forEach(function (kv) {
+    if (!kv) return;
+    var i = kv.indexOf('='), k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i));
+    q[k] = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1));
+  });
+  var player = null, apiState = 'none', pending = null, endedSent = false, curId = '', timer = null;
+  var isHttp = /^https?:$/.test(location.protocol);
+  var ref = q.ref || 'https://kiddytb001.kiddytube';
+
+  function post(o) {
+    o.kt = 1;
+    try { parent.postMessage(JSON.stringify(o), '*'); } catch (e) { /* standalone */ }
+  }
+  function cover(on) { document.getElementById('cover').style.display = on ? 'block' : 'none'; }
+  function stateName(s) { return s === 1 ? 'playing' : s === 2 ? 'paused' : s === 3 ? 'buffering' : s === 0 ? 'ended' : s === 5 ? 'cued' : 'idle'; }
+
+  function sendEnded() {
+    if (endedSent) return;
+    endedSent = true;
+    cover(true);
+    try { if (player && player.pauseVideo) player.pauseVideo(); } catch (e) {}
+    post({ t: 'ended' });
+  }
+  function snapshot() {
+    try {
+      if (!player || !player.getCurrentTime) return { pos: 0, dur: 0, s: 'idle' };
+      return { pos: Math.floor((player.getCurrentTime() || 0) * 1000), dur: Math.floor((player.getDuration() || 0) * 1000), s: stateName(player.getPlayerState ? player.getPlayerState() : -1) };
+    } catch (e) { return { pos: 0, dur: 0, s: 'idle' }; }
+  }
+  function startTicker() {
+    if (timer) return;
+    timer = setInterval(function () {
+      var sn = snapshot();
+      post({ t: 'progress', pos: sn.pos, dur: sn.dur, s: sn.s });
+      // Belt and braces: some embeds never fire state 0 at the very end.
+      if (!endedSent && sn.dur > 3000 && sn.pos >= sn.dur - 1200 && sn.s === 'playing') sendEnded();
+    }, 1000);
+  }
+
+  /* ---------------- real YouTube player ---------------- */
+  function loadApi() {
+    if (apiState !== 'none') return;
+    apiState = 'loading';
+    window.onYouTubeIframeAPIReady = function () { apiState = 'ready'; if (pending) { var p = pending; pending = null; doLoad(p.id, p.start); } };
+    var s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    s.onerror = function () { post({ t: 'error', code: 'api' }); };
+    document.head.appendChild(s);
+  }
+  function size() { return { w: window.innerWidth || 1280, h: window.innerHeight || 720 }; }
+  function doLoad(id, start) {
+    endedSent = false; cover(false); curId = id;
+    var st = Math.max(0, Math.floor(start || 0));
+    if (player && player.loadVideoById) {
+      try { player.loadVideoById({ videoId: id, startSeconds: st }); startTicker(); return; } catch (e) {}
+    }
+    var sz = size();
+    var vars = { autoplay: 1, controls: 0, disablekb: 1, fs: 0, iv_load_policy: 3, modestbranding: 1, rel: 0,
+                 playsinline: 1, cc_load_policy: 0, start: st, origin: isHttp ? location.origin : ref, widget_referrer: isHttp ? location.href : ref };
+    player = new YT.Player('p', {
+      width: sz.w, height: sz.h, videoId: id, host: 'https://www.youtube-nocookie.com', playerVars: vars,
+      events: {
+        onReady: function (e) { post({ t: 'ready' }); try { e.target.playVideo(); } catch (err) {} },
+        onStateChange: function (e) { post({ t: 'state', s: stateName(e.data) }); if (e.data === 0) sendEnded(); },
+        onError: function (e) { post({ t: 'error', code: e.data }); }
+      }
+    });
+    startTicker();
+  }
+
+  /* ---------------- offline mock (tests / demo without internet) ---------------- */
+  var mock = null;
+  function mockLoad(id, start) {
+    endedSent = false; cover(false); curId = id;
+    var dur = (parseFloat(q.dur) || 12), box = document.getElementById('mock');
+    box.style.display = 'block';
+    if (mock && mock.iv) clearInterval(mock.iv);
+    mock = { id: id, pos: Math.max(0, start || 0), dur: dur, playing: true, iv: null };
+    if (/^ERR/.test(id)) { setTimeout(function () { post({ t: 'error', code: 150 }); }, 300); return; }
+    post({ t: 'ready' }); post({ t: 'state', s: 'playing' });
+    mock.iv = setInterval(function () {
+      if (mock.playing) mock.pos += 1;
+      box.textContent = 'MOCK PLAYER ' + id + '  ' + Math.floor(mock.pos) + '/' + Math.floor(mock.dur) + 's ' + (mock.playing ? 'playing' : 'paused');
+      post({ t: 'progress', pos: Math.floor(mock.pos * 1000), dur: Math.floor(mock.dur * 1000), s: mock.playing ? 'playing' : 'paused' });
+      if (mock.pos >= mock.dur && !endedSent) { endedSent = true; clearInterval(mock.iv); post({ t: 'state', s: 'ended' }); post({ t: 'ended' }); }
+    }, 1000);
+  }
+
+  /* ---------------- command channel ---------------- */
+  function cmd(d) {
+    if (d.t === 'load') {
+      if (q.mock) { mockLoad(d.id, d.start / 1000); return; }
+      if (apiState !== 'ready') { pending = { id: d.id, start: d.start / 1000 }; loadApi(); return; }
+      doLoad(d.id, d.start / 1000); return;
+    }
+    if (q.mock) {
+      if (!mock) return;
+      if (d.t === 'toggle') mock.playing = !mock.playing;
+      else if (d.t === 'play') mock.playing = true;
+      else if (d.t === 'pause') mock.playing = false;
+      else if (d.t === 'seek') mock.pos = Math.max(0, Math.min(mock.dur - 1, d.sec));
+      else if (d.t === 'stop') { clearInterval(mock.iv); mock.playing = false; }
+      post({ t: 'state', s: mock.playing ? 'playing' : 'paused' });
+      return;
+    }
+    if (!player) return;
+    try {
+      if (d.t === 'toggle') { var s = player.getPlayerState(); if (s === 1) player.pauseVideo(); else player.playVideo(); }
+      else if (d.t === 'play') player.playVideo();
+      else if (d.t === 'pause') player.pauseVideo();
+      else if (d.t === 'seek') { player.seekTo(Math.max(0, d.sec), true); player.playVideo(); }
+      else if (d.t === 'stop') { player.stopVideo(); cover(true); }
+    } catch (e) {}
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return; } }
+    if (!d || d.kt !== 1) return;
+    cmd(d);
+  });
+  window.addEventListener('resize', function () {
+    if (player && player.setSize) { var sz = size(); player.setSize(sz.w, sz.h); }
+  });
+  // If this document ever receives key focus, hand the keys back to the app.
+  document.addEventListener('keydown', function (e) { post({ t: 'key', keyCode: e.keyCode, key: e.key }); e.preventDefault(); }, true);
+
+  post({ t: 'hello' });
+  if (q.v) cmd({ t: 'load', id: q.v, start: (parseFloat(q.t) || 0) * 1000 });   // standalone use: player.html?v=VIDEOID
+})();
+</script>
+</body>
+</html>
